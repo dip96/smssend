@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/xuri/excelize/v2"
 	"io"
 	"net/http"
 	"os"
+	"smssend/internal/files"
+	"smssend/internal/files/excel"
 	"sync"
 	"time"
 )
@@ -24,6 +26,11 @@ type SMSRequest struct {
 		Phone    string `json:"phone"`
 		Priority int    `json:"priority"`
 	} `json:"sms"`
+}
+
+type SMSData struct {
+	Index  int
+	Number string
 }
 
 type SMSResponse struct {
@@ -42,35 +49,75 @@ func main() {
 }
 
 func process() error {
-	f, err := openExcelFile("city_persons.xlsx")
+	var file files.FileHandler = &excel.Excel{}
+	err := file.Open("city_persons.xlsx")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer file.Close()
 
-	textSms, err := getTextSms(f)
-	if err != nil {
-		return err
-	}
-
-	numbers, err := getPhoneNumbers(f)
+	err = processNumbers(file)
 	if err != nil {
 		return err
 	}
 
-	err = processNumbers(numbers, textSms, f)
-	if err != nil {
-		return err
-	}
-
-	if err := saveFile(f); err != nil {
+	if err := file.SaveFile(); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func sendSMS(number, text string) (string, error) {
+func processNumbers(f files.FileHandler) error {
+	var wg sync.WaitGroup
+
+	//использую шаблон многопоточности - Worker Pool
+	const numWorkers = 5
+	numPhones := make(chan SMSData, numWorkers)
+
+	wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go processNumber(numPhones, f, &wg)
+	}
+
+	defer func() {
+		close(numPhones)
+		wg.Wait()
+	}()
+
+	phoneNumbers, err := f.GetPhoneNumbers()
+	if err != nil {
+		return err
+	}
+
+	for i, number := range phoneNumbers {
+		if number == "phone" || number == "" {
+			continue
+		}
+		numPhones <- SMSData{i, number}
+	}
+
+	return nil
+}
+
+func processNumber(ch <-chan SMSData, f files.FileHandler, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	for data := range ch {
+		result, err := sendSMS(ctx, data.Number, f.GetTextSms())
+		if err != nil {
+			result = err.Error()
+		}
+
+		cell := fmt.Sprintf("B%d", data.Index+1)
+		f.SetCellValue(cell, result)
+	}
+}
+
+func sendSMS(ctx context.Context, number, text string) (string, error) {
 	//Для тестирования на локали отключаю проверку ssl сертификата
 	//tr := &http.Transport{
 	//	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -96,7 +143,7 @@ func sendSMS(number, text string) (string, error) {
 		return "", fmt.Errorf("ошибка marshalling JSON: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", smsAPIUrl, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", smsAPIUrl, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("ошибка создания запроса: %v", err)
 	}
@@ -125,60 +172,6 @@ func sendSMS(number, text string) (string, error) {
 	}
 
 	return "", fmt.Errorf("ошибка API: %s", smsResp.Message)
-}
-
-func openExcelFile(filename string) (*excelize.File, error) {
-	return excelize.OpenFile(filename)
-}
-
-func getTextSms(f *excelize.File) (string, error) {
-	return f.GetCellValue("Лист1", "H2")
-}
-
-func getPhoneNumbers(f *excelize.File) ([]string, error) {
-	rows, err := f.GetCols("Лист1")
-	if err != nil {
-		return nil, err
-	}
-	return rows[0], nil
-}
-
-func processNumbers(numbers []string, textSms string, f *excelize.File) error {
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for i, number := range numbers {
-		if number == "phone" || number == "" {
-			continue
-		}
-		wg.Add(1)
-		go func(i int, number string) {
-			defer wg.Done()
-			processNumber(i, number, textSms, f, &mu)
-		}(i, number)
-	}
-
-	wg.Wait()
-	return nil
-}
-
-func processNumber(i int, number, textSms string, f *excelize.File, mu *sync.Mutex) {
-	result, err := sendSMS(number, textSms)
-	if err != nil {
-		result = err.Error()
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	cell := fmt.Sprintf("B%d", i+1)
-	if err := f.SetCellValue("Лист1", cell, result); err != nil {
-		fmt.Printf("Ошибка записи в ячейку %s: %v\n", cell, err)
-	}
-}
-
-func saveFile(f *excelize.File) error {
-	return f.Save()
 }
 
 func endApp() {
